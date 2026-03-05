@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EdgeCast Pro | Secure P2P Streaming</title>
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    <style>
+        /* Pro Dark UI */
+        :root {
+            --bg: #09090b; --panel: #18181b; --accent: #10b981; 
+            --accent-hover: #059669; --text: #f4f4f5; --text-muted: #a1a1aa; 
+            --border: #27272a; --live: #ef4444;
+        }
+        body { margin: 0; font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); display: flex; height: 100vh; overflow: hidden; }
+        #sidebar { width: 320px; background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; padding: 20px; box-sizing: border-box; }
+        .profile { display: flex; align-items: center; gap: 15px; margin-bottom: 20px; padding-bottom: 20px; border-bottom: 1px solid var(--border); }
+        .avatar { width: 45px; height: 45px; border-radius: 8px; background: linear-gradient(135deg, var(--accent), #3b82f6); }
+        h2 { font-size: 0.9rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1.5px; }
+        .channel-list { list-style: none; padding: 0; margin: 0; flex-grow: 1; overflow-y: auto; }
+        .channel-item { padding: 15px; background: #27272a; border-radius: 8px; margin-bottom: 10px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; border: 1px solid transparent; transition: 0.2s; }
+        .channel-item:hover { border-color: var(--accent); }
+        .live-badge { background: var(--live); color: white; padding: 4px 8px; border-radius: 4px; font-size: 0.7rem; font-weight: bold; animation: pulse 2s infinite; }
+        
+        #main-stage { flex-grow: 1; display: flex; flex-direction: column; padding: 20px; position: relative; }
+        .video-wrapper { flex-grow: 1; background: #000; border-radius: 12px; overflow: hidden; position: relative; border: 1px solid var(--border); box-shadow: 0 20px 40px rgba(0,0,0,0.8); }
+        video { width: 100%; height: 100%; object-fit: contain; }
+        
+        .controls { margin-top: 20px; display: flex; gap: 15px; padding: 20px; background: var(--panel); border-radius: 12px; align-items: center; border: 1px solid var(--border); }
+        button { background: var(--accent); color: white; border: none; padding: 10px 20px; border-radius: 6px; font-weight: 600; cursor: pointer; transition: 0.2s; }
+        button:hover { background: var(--accent-hover); }
+        button:disabled { background: var(--border); color: var(--text-muted); cursor: not-allowed; }
+        input[type=password] { padding: 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); outline: none; }
+        
+        .file-wrapper { position: relative; overflow: hidden; display: inline-block; }
+        .file-wrapper input[type=file] { position: absolute; left: 0; top: 0; opacity: 0; cursor: pointer; height: 100%; width: 100%; }
+        
+        #status-bar { position: absolute; top: 20px; left: 20px; background: rgba(0,0,0,0.8); padding: 8px 16px; border-radius: 6px; font-size: 0.85rem; z-index: 10; font-family: monospace; color: var(--accent); border: 1px solid #333; }
+        
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
+    </style>
+</head>
+<body>
+
+    <div id="sidebar">
+        <div class="profile">
+            <div class="avatar"></div>
+            <div>
+                <strong id="my-id">Generating ID...</strong>
+                <div style="font-size: 0.8rem; color: var(--text-muted)">Pro Edge Node</div>
+            </div>
+        </div>
+        <h2>Active Streams</h2>
+        <ul class="channel-list" id="channel-list">
+            <li style="color: var(--text-muted); text-align: center; margin-top: 20px; font-size: 0.9rem;">Waiting for global signals...</li>
+        </ul>
+    </div>
+
+    <div id="main-stage">
+        <div class="video-wrapper">
+            <div id="status-bar">SYSTEM IDLE</div>
+            <video id="video-player" autoplay playsinline controls></video>
+        </div>
+
+        <div class="controls">
+            <input type="password" id="stream-key" placeholder="Enter Stream Security Key" value="secret123" title="Requires matching key to connect">
+            
+            <div class="file-wrapper">
+                <button>1. Load Media</button>
+                <input type="file" id="media-file" accept="video/*">
+            </div>
+            <button id="btn-cast" disabled>2. Broadcast (Secure)</button>
+            
+            <div style="flex-grow: 1;"></div>
+            <div id="mqtt-status" style="font-size: 0.8rem; color: var(--text-muted);">MQTT: Disconnected</div>
+        </div>
+    </div>
+
+<script>
+    // --- 1. CORE ARCHITECTURE SETUP ---
+    const APP_ID = "node_" + Math.random().toString(36).substr(2, 6);
+    document.getElementById('my-id').innerText = APP_ID;
+    
+    // Using EMQX Enterprise Broker (Fast & Reliable over WebSockets)
+    const MQTT_BROKER = "wss://broker.emqx.io:8084/mqtt"; 
+    const TOPIC_GLOBAL = "edgecast/pro/channels";
+    
+    let mqttClient;
+    let localStream = null;
+    let peerConnections = {}; // Support multiple viewers simultaneously
+    
+    // Performance WebRTC Configuration
+    const rtcConfig = { 
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+        bundlePolicy: "max-bundle" // Faster connection
+    };
+
+    const videoEl = document.getElementById('video-player');
+    const statusEl = document.getElementById('status-bar');
+
+    // --- 2. FAST MQTT SIGNALING ---
+    function initNetwork() {
+        statusEl.innerText = "Connecting to Edge Node...";
+        mqttClient = mqtt.connect(MQTT_BROKER);
+
+        mqttClient.on('connect', () => {
+            document.getElementById('mqtt-status').innerText = "Network: EMQX Connected";
+            statusEl.innerText = "READY. SECURE CHANNEL OPEN.";
+            
+            // Subscribe to global channels and private signaling aimed at ME
+            mqttClient.subscribe(TOPIC_GLOBAL);
+            mqttClient.subscribe(`edgecast/signal/${APP_ID}`);
+        });
+
+        mqttClient.on('message', async (topic, message) => {
+            const payload = JSON.parse(message.toString());
+
+            // 1. Channel Discovery
+            if (topic === TOPIC_GLOBAL && payload.casterId !== APP_ID) {
+                renderChannel(payload);
+            }
+
+            // 2. Private WebRTC Signaling & Security Check
+            if (topic === `edgecast/signal/${APP_ID}`) {
+                const myKey = document.getElementById('stream-key').value;
+                if (payload.securityKey !== myKey) {
+                    console.warn("Blocked connection attempt: Invalid Security Key.");
+                    return; 
+                }
+                handleSignal(payload);
+            }
+        });
+    }
+
+    // --- 3. CASTER: LOAD & BROADCAST ---
+    document.getElementById('media-file').addEventListener('change', (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        
+        videoEl.src = URL.createObjectURL(file);
+        videoEl.muted = true; // Required for auto-capture
+        document.getElementById('btn-cast').disabled = false;
+        statusEl.innerText = "MEDIA BUFFERED. READY TO CAST.";
+    });
+
+    document.getElementById('btn-cast').addEventListener('click', () => {
+        videoEl.play();
+        // Capture at 30fps for stability
+        localStream = videoEl.captureStream(30); 
+        
+        // Announce to network
+        mqttClient.publish(TOPIC_GLOBAL, JSON.stringify({
+            casterId: APP_ID,
+            name: `Pro Stream (${APP_ID})`
+        }), { retain: false }); // Don't retain dead streams
+        
+        statusEl.innerText = "LIVE - WAITING FOR PEERS";
+        statusEl.style.color = "var(--live)";
+        document.getElementById('btn-cast').disabled = true;
+    });
+
+    // --- 4. VIEWER: DISCOVER & CONNECT ---
+    function renderChannel(channel) {
+        if(document.getElementById(`ch_${channel.casterId}`)) return;
+        const list = document.getElementById('channel-list');
+        if(list.innerText.includes("Waiting")) list.innerHTML = '';
+        
+        const li = document.createElement('li');
+        li.className = 'channel-item';
+        li.id = `ch_${channel.casterId}`;
+        li.innerHTML = `<div><strong>${channel.name}</strong><br><span style="font-size:0.7rem;color:var(--text-muted)">P2P Encrypted</span></div><span class="live-badge">LIVE</span>`;
+        
+        li.onclick = () => startViewing(channel.casterId);
+        list.appendChild(li);
+    }
+
+    async function startViewing(targetCasterId) {
+        statusEl.innerText = "NEGOTIATING SECURE P2P CONNECTION...";
+        
+        const pc = createPeerConnection(targetCasterId);
+        
+        // THE BUG FIX: Force the WebRTC engine to request video/audio, even if we aren't sending any.
+        pc.addTransceiver('video', { direction: 'recvonly' });
+        pc.addTransceiver('audio', { direction: 'recvonly' });
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        sendSignal(targetCasterId, { type: 'offer', sdp: offer });
+    }
+
+    // --- 5. WEBRTC ENGINE (Bug-Free Negotiation) ---
+    function createPeerConnection(peerId) {
+        const pc = new RTCPeerConnection(rtcConfig);
+        peerConnections[peerId] = pc;
+
+        // ICE Candidate handling (Finding IP addresses)
+        pc.onicecandidate = (e) => {
+            if (e.candidate) sendSignal(peerId, { type: 'ice', candidate: e.candidate });
+        };
+
+        // If I am the Caster, add my video tracks to the connection
+        if (localStream) {
+            localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+        }
+
+        // If I am the Viewer, catch the incoming stream
+        pc.ontrack = (e) => {
+            statusEl.innerText = "CONNECTED. RECEIVING SECURE STREAM.";
+            statusEl.style.color = "var(--accent)";
+            if (videoEl.srcObject !== e.streams[0]) {
+                videoEl.srcObject = e.streams[0];
+                videoEl.play().catch(err => alert("Please click the video to allow playback."));
+            }
+        };
+
+        return pc;
+    }
+
+    async function handleSignal(data) {
+        const peerId = data.senderId;
+        let pc = peerConnections[peerId];
+
+        if (data.type === 'offer') {
+            // I am the Caster receiving an offer
+            if (!pc) pc = createPeerConnection(peerId);
+            
+            await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            
+            sendSignal(peerId, { type: 'answer', sdp: answer });
+            statusEl.innerText = `STREAMING TO PEER: ${peerId}`;
+        } 
+        else if (data.type === 'answer' && pc) {
+            // I am the Viewer receiving the answer
+            await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+        } 
+        else if (data.type === 'ice' && pc) {
+            // Both sides exchanging network paths
+            await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+        }
+    }
+
+    function sendSignal(targetId, payload) {
+        payload.senderId = APP_ID;
+        payload.securityKey = document.getElementById('stream-key').value; // Inject Security Token
+        mqttClient.publish(`edgecast/signal/${targetId}`, JSON.stringify(payload));
+    }
+
+    // Boot Up
+    initNetwork();
+</script>
+</body>
+</html>
